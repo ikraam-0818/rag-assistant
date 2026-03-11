@@ -45,14 +45,15 @@ OPENAI_API_KEY=your_openai_api_key_here
 Because the project is written in TypeScript, you can run it directly using `ts-node`, or build it into JavaScript.
 
 **To run directly (Development):**
+Pass your query in quotes after the command:
 ```bash
-npx ts-node src/index.ts
+npx ts-node src/index.ts "What is the customer policy"
 ```
 
 **To compile to JavaScript (Production):**
 ```bash
 npx tsc
-node dist/index.js
+node dist/index.js "What is the customer policy"
 ```
 
 *(Note: The exact entry file might change depending on the codebase structure. Verify that `src/index.ts` or `index.ts` is the current main entry point).*
