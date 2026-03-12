@@ -3,6 +3,7 @@ import * as path from 'path';
 import 'dotenv/config';
 import OpenAI from 'openai';
 import { ChromaClient } from 'chromadb';
+import { QdrantClient } from '@qdrant/js-client-rest';
 const PDFParser = require("pdf2json");
 // 1. Initialize Clients
 if (!process.env.OPENAI_API_KEY) {
@@ -19,7 +20,20 @@ const chroma = new ChromaClient({
     // You need a chroma server running for this to work natively (e.g., docker run -p 8000:8000 chromadb/chroma)
 });
 
+// We provide our own embeddings via OpenAI. 
+// However, Chroma still expects a default embedding function object for collection operations.
+// This dummy object satisfies its interface and prevents the noisy warnings.
+const dummyEmbeddingFunction = {
+    generate: async (texts: string[]) => {
+        // Return an empty array of arrays to satisfy the type signature
+        return texts.map(() => []); 
+    }
+};
+
+const qdrant = new QdrantClient({ url: 'http://localhost:6333' });
+
 const COLLECTION_NAME = "rag_knowledge_collection";
+const VECTOR_DB = process.env.VECTOR_DB || "chroma"; // "chroma", "qdrant", or "evaluate"
 
 /**
  * A simple function to chunk text into paragraphs or smaller segments
@@ -87,27 +101,61 @@ async function main() {
         });
         const embeddings = embeddingResponse.data.map(d => d.embedding);
 
-        // 5. Store in ChromaDB
-        console.log("Connecting to ChromaDB and storing chunks...");
+        // 5. Store in VectorDB
+        console.log(`Connecting to ${VECTOR_DB.toUpperCase()} and storing chunks...`);
 
-        // We try to delete the collection first if it exists to keep this script idempotent
-        try {
-            await chroma.deleteCollection({ name: COLLECTION_NAME });
-        } catch (e) { /* ignore if doesn't exist */ }
+        if (VECTOR_DB === 'chroma' || VECTOR_DB === 'evaluate') {
+            const startStr = Date.now();
+            // We try to delete the collection first if it exists to keep this script idempotent
+            try {
+                // @ts-ignore - Supress TS complaining because the typings for deleteCollection don't officially support passing embeddingFunction right now
+                await chroma.deleteCollection({ name: COLLECTION_NAME, embeddingFunction: dummyEmbeddingFunction });
+            } catch (e) { /* ignore if doesn't exist */ }
 
-        const collection = await chroma.createCollection({
-            name: COLLECTION_NAME,
-        });
+            const collection = await chroma.createCollection({
+                name: COLLECTION_NAME,
+                embeddingFunction: dummyEmbeddingFunction
+            });
 
-        const ids = chunks.map((_, i) => `chunk_${i}`);
+            const ids = chunks.map((_, i) => `chunk_${i}`);
 
-        await collection.add({
-            ids: ids,
-            embeddings: embeddings,
-            documents: chunks,
-        });
+            await collection.add({
+                ids: ids,
+                embeddings: embeddings,
+                documents: chunks,
+            });
+            const endStr = Date.now();
+            console.log(`[Metrics] ChromaDB Ingestion Time: ${endStr - startStr}ms`);
+        }
+        
+        if (VECTOR_DB === 'qdrant' || VECTOR_DB === 'evaluate') {
+            const startStr = Date.now();
+            try {
+                await qdrant.deleteCollection(COLLECTION_NAME);
+            } catch (e) { /* ignore */ }
 
-        console.log("Ingestion complete!");
+            await qdrant.createCollection(COLLECTION_NAME, {
+                vectors: {
+                    size: embeddings[0].length, // 1536 for text-embedding-3-small
+                    distance: 'Cosine',
+                },
+            });
+
+            const points = chunks.map((chunk, i) => ({
+                id: i + 1, // Qdrant requires numeric or UUID ids
+                vector: embeddings[i],
+                payload: { document: chunk }
+            }));
+
+            await qdrant.upsert(COLLECTION_NAME, {
+                wait: true,
+                points: points
+            });
+            const endStr = Date.now();
+            console.log(`[Metrics] Qdrant Ingestion Time: ${endStr - startStr}ms`);
+        }
+
+        console.log(`Ingestion phase complete!`);
 
         // ==========================================
         // Query Phase
@@ -124,14 +172,51 @@ async function main() {
         const questionVector = qEmbeddingResponse.data[0].embedding;
 
         // 2. Retrieve relevant chunks
-        console.log("Retrieving relevant context...");
-        const results = await collection.query({
-            queryEmbeddings: [questionVector],
-            nResults: 2, // Top 2 chunks
-        });
+        console.log(`Retrieving relevant context from ${VECTOR_DB.toUpperCase()}...`);
+        let retrievedContext = "";
 
-        const retrievedContext = results.documents[0].join("\n\n");
-        console.log("Context retrieved:\n", retrievedContext, "\n");
+        if (VECTOR_DB === 'chroma' || VECTOR_DB === 'evaluate') {
+            const startQ = Date.now();
+            const collection = await chroma.getCollection({ 
+                name: COLLECTION_NAME,
+                embeddingFunction: dummyEmbeddingFunction
+            });
+            const results = await collection.query({
+                queryEmbeddings: [questionVector],
+                nResults: 2, // Top 2 chunks
+            });
+            const endQ = Date.now();
+            console.log(`[Metrics] ChromaDB Query Time: ${endQ - startQ}ms`);
+            
+            // In evaluate mode, we default to passing Chroma's context to the LLM
+            retrievedContext = results.documents[0].join("\n\n");
+            
+            if (VECTOR_DB === 'evaluate') {
+                console.log("[EVALUATE] Chroma Retrieved Context:\n", retrievedContext, "\n");
+            }
+        }
+        
+        if (VECTOR_DB === 'qdrant' || VECTOR_DB === 'evaluate') {
+            const startQ = Date.now();
+            const results = await qdrant.search(COLLECTION_NAME, {
+                vector: questionVector,
+                limit: 2,
+            });
+            const endQ = Date.now();
+            console.log(`[Metrics] Qdrant Query Time: ${endQ - startQ}ms`);
+            
+            const qdrantContext = results.map(hit => hit.payload?.document as string).join("\n\n");
+            
+            if (VECTOR_DB === 'evaluate') {
+                console.log("[EVALUATE] Qdrant Retrieved Context:\n", qdrantContext, "\n");
+            }
+            
+            if (VECTOR_DB === 'qdrant') {
+                retrievedContext = qdrantContext;
+            }
+        }
+
+        console.log("Context retrieved successfully (Content truncated for brevity)\n");
 
         // 3. Generate Answer
         console.log("Generating Answer using LLM...");
